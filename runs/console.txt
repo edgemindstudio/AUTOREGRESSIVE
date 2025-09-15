@@ -1,0 +1,17 @@
+[2025-09-13T17:59:50Z] ConditionalAutoregressive | seed=42 | notes=phase2-real
+  FID: 138.7476
+  cFID (macro): 160.5762
+  Diversity: 0.0067
+  JS: 0.07001467844759725 | KL: 2.9466224080469203
+  Utility Δ(RS−R): accuracy=0.0060, macro_f1=0.0057, balanced_accuracy=0.0061, macro_auprc=0.0025, recall_at_1pct_fpr=0.0165, ece=0.0068, brier=-0.0066
+  Images: {'train_real': 81000, 'val_real': None, 'test_real': None, 'synthetic': 225}
+Model: ConditionalAutoregressive   Seed: 42
+Counts → train:81000  val:4500  test:4500  synth:None
+Generative → FID(macro): None  cFID(macro): None  JS: None  KL: None  Div: None
+Utility R   → acc: 0.9582222222222222  bal_acc: 0.9587212726976598  macro_f1: 0.9585811501796742
+Utility R+S → acc: None  bal_acc: None  macro_f1: None
+Model: ConditionalAutoregressive   Seed: 42
+Counts → train:81000  val:4500  test:4500  synth:225
+Generative → FID(macro): 138.74759886739588  cFID(macro): 160.57624706702853  JS: 0.07001467844759725  KL: 2.9466224080469203  Div: 0.006711335387080908
+Utility R   → acc: 0.9566666666666667  bal_acc: 0.9571749948094337  macro_f1: 0.9569132043283474
+Utility R+S → acc: 0.9548888888888889  bal_acc: 0.9557581696822426  macro_f1: 0.9552238784994707
