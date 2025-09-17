@@ -10,33 +10,6 @@ This module keeps the training loop small, explicit, and framework-idiomatic:
 - TensorBoard logging (optional)
 - Robust checkpointing using Keras 3-friendly names (*.weights.h5)
 
-Typical usage (inside your pipeline):
-
-    from pathlib import Path
-    import tensorflow as tf
-    from autoregressive.models import build_conditional_pixelcnn
-    from autoregressive.train import (
-        make_datasets, fit_autoregressive, make_writer
-    )
-
-    model = build_conditional_pixelcnn(img_shape, num_classes)
-    opt   = tf.keras.optimizers.Adam(learning_rate=2e-4, beta_1=0.5)
-
-    ds_train, ds_val = make_datasets(x_train01, y_train_1h, x_val01, y_val_1h, batch_size=256)
-    writer = make_writer("artifacts/tensorboard")   # optional
-
-    fit_autoregressive(
-        model=model,
-        optimizer=opt,
-        train_ds=ds_train,
-        val_ds=ds_val,
-        epochs=200,
-        checkpoint_dir=Path("artifacts/autoregressive/checkpoints"),
-        writer=writer,
-        patience=10,
-        save_every=25,
-    )
-
 Notes
 -----
 - The model is expected to be conditioned on labels: `model([x, y_onehot]) -> probs`,
@@ -49,10 +22,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 import tensorflow as tf
+
+# Model builder (assumed available in your repo)
+from autoregressive.models import build_conditional_pixelcnn
+
+# Optional shared loader used across modules
+try:
+    from common.data import load_dataset_npy  # type: ignore
+except Exception:
+    load_dataset_npy = None  # we'll fall back to raw .npy files
 
 
 # ---------------------------------------------------------------------
@@ -69,6 +51,37 @@ class TrainConfig:
 
 
 # ---------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------
+def _cfg_get(cfg: Dict, dotted: str, default=None):
+    cur = cfg
+    for key in dotted.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _to_float01(x: np.ndarray) -> np.ndarray:
+    """Ensure float32 in [0,1] (handles 0..255)."""
+    x = x.astype("float32", copy=False)
+    if x.max() > 1.5:
+        x = x / 255.0
+    return np.clip(x, 0.0, 1.0)
+
+
+def _to_onehot(y: np.ndarray, num_classes: int) -> np.ndarray:
+    """Accept (N,) ints or (N,K) one-hot; return (N,K) one-hot float32."""
+    y = np.asarray(y)
+    if y.ndim == 2 and y.shape[1] == num_classes:
+        y1h = y
+    else:
+        y = y.astype(int).reshape(-1)
+        y1h = np.eye(num_classes, dtype="float32")[y]
+    return y1h.astype("float32", copy=False)
+
+
+# ---------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------
 def make_datasets(
@@ -81,17 +94,6 @@ def make_datasets(
 ) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
     """
     Build shuffling, batched tf.data pipelines for training and validation.
-
-    Args
-    ----
-    x_train01, x_val01 : float32 arrays in [0, 1], shape (N, H, W, C)
-    y_train_1h, y_val_1h : one-hot labels, shape (N, num_classes)
-    batch_size : batch size
-    shuffle_buffer : buffer for shuffling the train dataset
-
-    Returns
-    -------
-    (train_ds, val_ds)
     """
     def _ds(x, y, training=False):
         ds = tf.data.Dataset.from_tensor_slices((x, y))
@@ -133,18 +135,6 @@ def fit_autoregressive(
     """
     Train an autoregressive conditional model with early stopping & checkpoints.
 
-    Args
-    ----
-    model : expects `model([x, y_onehot], training=...) -> probs`
-    optimizer : tf.keras optimizer
-    train_ds, val_ds : tf.data datasets of (x, y_onehot)
-    epochs : total epochs to run
-    checkpoint_dir : where to save *.weights.h5 checkpoints
-    writer : optional TensorBoard summary writer
-    patience : early-stopping patience on validation loss
-    save_every : save periodic epoch snapshots as AR_epoch_XXXX.weights.h5
-    from_logits : if True, uses BCE(from_logits=True). Default False (sigmoid probs)
-
     Saves
     -----
     - AR_best.weights.h5  (lowest validation loss)
@@ -157,7 +147,7 @@ def fit_autoregressive(
     train_loss_metric = tf.keras.metrics.Mean(name="train_loss")
     val_loss_metric   = tf.keras.metrics.Mean(name="val_loss")
 
-    @tf.function
+    @tf.function(reduce_retracing=True)
     def train_step(x, y1h):
         with tf.GradientTape() as tape:
             probs = model([x, y1h], training=True)
@@ -166,7 +156,7 @@ def fit_autoregressive(
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         train_loss_metric.update_state(loss)
 
-    @tf.function
+    @tf.function(reduce_retracing=True)
     def val_step(x, y1h):
         probs = model([x, y1h], training=False)
         loss  = bce(x, probs)
@@ -211,7 +201,7 @@ def fit_autoregressive(
             model.save_weights(str(snap))
 
         # --- Best checkpoint & early stopping
-        if val_loss < best_val - 1e-6:  # small margin to reduce ties
+        if val_loss < best_val - 1e-6:
             best_val  = val_loss
             no_improve = 0
             model.save_weights(str(checkpoint_dir / "AR_best.weights.h5"))
@@ -225,4 +215,94 @@ def fit_autoregressive(
     model.save_weights(str(checkpoint_dir / "AR_last.weights.h5"))
 
 
-__all__ = ["TrainConfig", "make_datasets", "make_writer", "fit_autoregressive"]
+# ---------------------------------------------------------------------
+# Unified-CLI adapter
+# ---------------------------------------------------------------------
+def train(cfg: Dict) -> None:
+    """
+    Adapter for the unified `gencs` CLI.
+
+    Expects keys (with reasonable fallbacks):
+      IMG_SHAPE (H,W,C), NUM_CLASSES, DATA_DIR
+      EPOCHS, BATCH_SIZE, PATIENCE, SAVE_EVERY, LR, FROM_LOGITS
+      paths.artifacts or ARTIFACTS.autoregressive_checkpoints/summaries
+    """
+    # --- Shapes & classes
+    H, W, C = tuple(_cfg_get(cfg, "IMG_SHAPE", _cfg_get(cfg, "img.shape", (40, 40, 1))))
+    K = int(_cfg_get(cfg, "NUM_CLASSES", _cfg_get(cfg, "num_classes", 9)))
+    img_shape = (H, W, C)
+
+    # --- Hyperparameters
+    epochs     = int(_cfg_get(cfg, "EPOCHS", 200))
+    batch_size = int(_cfg_get(cfg, "BATCH_SIZE", 256))
+    patience   = int(_cfg_get(cfg, "PATIENCE", 10))
+    save_every = int(_cfg_get(cfg, "SAVE_EVERY", 25))
+    lr         = float(_cfg_get(cfg, "LR", 2e-4))
+    from_logits = bool(_cfg_get(cfg, "FROM_LOGITS", False))
+    seed       = int(_cfg_get(cfg, "SEED", 42))
+    tf.keras.utils.set_random_seed(seed)
+
+    # --- Artifact paths
+    artifacts_root = Path(_cfg_get(cfg, "paths.artifacts", "artifacts"))
+    model_root     = artifacts_root / "autoregressive"
+    ckpt_dir = Path(_cfg_get(cfg, "ARTIFACTS.autoregressive_checkpoints", model_root / "checkpoints"))
+    sums_dir = Path(_cfg_get(cfg, "ARTIFACTS.autoregressive_summaries",   model_root / "summaries"))
+    tb_dir   = Path(_cfg_get(cfg, "ARTIFACTS.autoregressive_tensorboard", model_root / "tensorboard"))
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    sums_dir.mkdir(parents=True, exist_ok=True)
+    tb_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Load data
+    data_dir = Path(_cfg_get(cfg, "DATA_DIR", _cfg_get(cfg, "data.root", "data")))
+    if load_dataset_npy is not None:
+        x_tr, y_tr, x_va, y_va, x_te, y_te = load_dataset_npy(
+            data_dir, img_shape, K, val_fraction=_cfg_get(cfg, "VAL_FRACTION", 0.5)
+        )
+    else:
+        x_tr = np.load(data_dir / "train_data.npy")
+        y_tr = np.load(data_dir / "train_labels.npy")
+        x_te = np.load(data_dir / "test_data.npy")
+        y_te = np.load(data_dir / "test_labels.npy")
+        # Split test -> (val, test)
+        n_val = int(len(x_te) * float(_cfg_get(cfg, "VAL_FRACTION", 0.5)))
+        x_va, y_va = x_te[:n_val], y_te[:n_val]
+        x_te, y_te = x_te[n_val:], y_te[n_val:]
+
+    # Normalize and ensure shapes
+    x_tr = _to_float01(x_tr).reshape((-1, H, W, C))
+    x_va = _to_float01(x_va).reshape((-1, H, W, C))
+    y_tr_1h = _to_onehot(y_tr, K)
+    y_va_1h = _to_onehot(y_va, K)
+
+    # --- Build datasets
+    train_ds, val_ds = make_datasets(x_tr, y_tr_1h, x_va, y_va_1h, batch_size=batch_size)
+
+    # --- Build model & optimizer
+    model = build_conditional_pixelcnn(img_shape, K)
+    opt   = tf.keras.optimizers.Adam(learning_rate=lr, beta_1=0.5)
+
+    # --- TensorBoard writer (optional)
+    writer = make_writer(tb_dir)
+
+    # --- Train
+    print(f"[config] img_shape={img_shape} | classes={K} | epochs={epochs} | bs={batch_size} | lr={lr}")
+    print(f"[paths]  ckpts={ckpt_dir.resolve()} | summaries={sums_dir.resolve()} | tb={tb_dir.resolve()}")
+
+    fit_autoregressive(
+        model=model,
+        optimizer=opt,
+        train_ds=train_ds,
+        val_ds=val_ds,
+        epochs=epochs,
+        checkpoint_dir=ckpt_dir,
+        writer=writer,
+        patience=patience,
+        save_every=save_every,
+        from_logits=from_logits,
+    )
+
+    # Simple marker file so orchestrators know training completed
+    (sums_dir / "train_done.txt").write_text("ok", encoding="utf-8")
+
+
+__all__ = ["TrainConfig", "make_datasets", "make_writer", "fit_autoregressive", "train"]

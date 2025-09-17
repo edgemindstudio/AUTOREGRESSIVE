@@ -11,3 +11,24 @@ logs/**
 eval/val_common.py
 eval/synth_loader.py
 .USTC-TFC2016_malware/
+
+*.pyc
+
+# Training artifacts & logs
+artifacts/
+reports/
+logs/
+tensorboard/
+
+# Datasets / large arrays
+data/
+*.npz
+*.csv
+
+# Model weights / checkpoints
+*.weights.h5
+*.ckpt*
+*.tfrecord
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
